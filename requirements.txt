@@ -1,0 +1,8 @@
+torch
+mlx-whisper
+sounddevice
+resemblyzer
+numpy
+xlwings
+openpyxl
+silero-vad
