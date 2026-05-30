@@ -4,3 +4,7 @@ __pycache__/
 *.db
 *.sqlite
 .DS_Store
+config.json
+viewer/.env.local
+viewer/.next/
+viewer/node_modules/
