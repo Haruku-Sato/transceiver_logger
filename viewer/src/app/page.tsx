@@ -5,10 +5,12 @@ export const dynamic = "force-dynamic";
 import { useEffect, useRef, useState } from "react";
 import { createClient } from "@supabase/supabase-js";
 
-const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
+const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";
+const supabase =
+  supabaseUrl && supabaseKey
+    ? createClient(supabaseUrl, supabaseKey)
+    : null;
 
 type Utterance = {
   id: number;
@@ -59,6 +61,7 @@ export default function Home() {
 
   // セッション一覧を取得
   useEffect(() => {
+    if (!supabase) return;
     supabase
       .from("utterances")
       .select("session_id, created_at")
@@ -79,6 +82,7 @@ export default function Home() {
 
   // 発話を取得（セッション切替時）
   useEffect(() => {
+    if (!supabase) return;
     let query = supabase
       .from("utterances")
       .select("*")
@@ -100,6 +104,7 @@ export default function Home() {
 
   // リアルタイム購読
   useEffect(() => {
+    if (!supabase) return;
     const channel = supabase
       .channel("utterances-realtime")
       .on(
