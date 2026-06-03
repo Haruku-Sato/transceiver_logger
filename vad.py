@@ -1,5 +1,4 @@
 import numpy as np
-import torch
 
 SAMPLE_RATE = 16000
 MIN_SPEECH_SAMPLES = 8000   # 0.5秒未満は無視
@@ -64,6 +63,7 @@ MIN_SILENCE_CHUNKS = 15     # ~480ms の無音で発言終了
 
 
 def _load_silero():
+    import torch  # VADモード使用時のみロード（起動高速化のため遅延import）
     try:
         from silero_vad import load_silero_vad
         return load_silero_vad()
@@ -87,6 +87,7 @@ class VAD:
         Returns: (完了した音声セグメント or None, 音声確率)
         PTTDetectorと同じ戻り値形式にする。
         """
+        import torch
         tensor = torch.from_numpy(chunk).float()
         with torch.no_grad():
             result = self._model(tensor, SAMPLE_RATE)

@@ -1,11 +1,48 @@
+import re
 import xlwings as xw
 from datetime import datetime
 
 _target_path: str | None = None
-_target_sheet: str | None = None  # None = 先頭シート
+_target_sheet: str | None = None
 _last_row: int | None = None
 
 HEADERS = ["時刻", "話者", "発言内容", "タグ", "要約"]
+
+# 改行の基準
+_BREAK_MIN = 8   # 現在の行がこれ以上のとき
+_BREAK_MAX = 10  # 次を足すとこれ以上になるなら改行
+
+
+def _add_linebreaks(text: str) -> str:
+    """句読点を基準に適切な位置で改行を挿入する。
+
+    ルール：
+    - 現在の蓄積が _BREAK_MIN 文字以上
+    - かつ次のセグメントを足すと _BREAK_MAX 文字以上になる
+    → 改行を挿入
+    """
+    # 句読点の直後で分割（句読点はセグメントに含める）
+    segments = [s for s in re.split(r'(?<=[。、！？,.!?])', text) if s]
+    if not segments:
+        return text
+
+    lines: list[str] = []
+    current = ""
+
+    for seg in segments:
+        if not current:
+            current = seg
+            continue
+        if len(current) >= _BREAK_MIN and len(current) + len(seg) >= _BREAK_MAX:
+            lines.append(current)
+            current = seg
+        else:
+            current += seg
+
+    if current:
+        lines.append(current)
+
+    return "\n".join(lines)
 
 
 def set_target(path: str) -> None:
@@ -18,7 +55,7 @@ def set_target(path: str) -> None:
 def set_sheet(name: str | None) -> None:
     global _target_sheet, _last_row
     _target_sheet = name
-    _last_row = None  # シート切替時は直前行をリセット
+    _last_row = None
 
 
 def get_target() -> str | None:
@@ -26,7 +63,6 @@ def get_target() -> str | None:
 
 
 def get_sheets(path: str) -> list[str]:
-    """シート名一覧を返す（read_only で軽量取得）"""
     from openpyxl import load_workbook
     wb = load_workbook(path, read_only=True, data_only=True)
     names = wb.sheetnames
@@ -49,8 +85,15 @@ def _next_row(ws) -> int:
     return row
 
 
+def _apply_format(ws, row: int) -> None:
+    """折り返し設定 + 列幅・行高さの自動調整"""
+    cell = ws.range(f"C{row}")
+    cell.wrap_text = True
+    ws.used_range.columns.autofit()
+    ws.used_range.rows.autofit()
+
+
 def append_row(speaker: str, text: str, tag: str = "", summary: str = "") -> int:
-    """行を追記して、書き込んだ行番号を返す"""
     global _last_row
 
     if not _target_path:
@@ -60,19 +103,20 @@ def append_row(speaker: str, text: str, tag: str = "", summary: str = "") -> int
     ws = _get_ws(wb)
 
     next_row = _next_row(ws)
-
     if next_row == 1:
         ws.range("A1").value = HEADERS
         next_row = 2
 
     timestamp = datetime.now().strftime("%H:%M:%S")
-    ws.range(f"A{next_row}").value = [timestamp, speaker, text, tag, summary]
+    formatted_text = _add_linebreaks(text)
+    ws.range(f"A{next_row}").value = [timestamp, speaker, formatted_text, tag, summary]
+    _apply_format(ws, next_row)
+
     _last_row = next_row
     return next_row
 
 
 def update_last_row(speaker: str, text: str, tag: str = "", summary: str = "") -> None:
-    """直前に書いた行を上書きする（修正用）"""
     if not _target_path:
         raise ValueError("出力先Excelファイルが設定されていません")
     if _last_row is None:
@@ -82,4 +126,6 @@ def update_last_row(speaker: str, text: str, tag: str = "", summary: str = "") -
     ws = _get_ws(wb)
 
     existing_time = ws.range(f"A{_last_row}").value or datetime.now().strftime("%H:%M:%S")
-    ws.range(f"A{_last_row}").value = [existing_time, speaker, text, tag, summary]
+    formatted_text = _add_linebreaks(text)
+    ws.range(f"A{_last_row}").value = [existing_time, speaker, formatted_text, tag, summary]
+    _apply_format(ws, _last_row)

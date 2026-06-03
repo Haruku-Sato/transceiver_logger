@@ -14,6 +14,7 @@ DEFAULT_CONFIG: dict = {
     "supabase_url": "",
     "supabase_key": "",
     "supabase_enabled": False,
+    "web_mode": False,
 }
 
 

@@ -1,14 +1,14 @@
 import numpy as np
-from resemblyzer import VoiceEncoder, preprocess_wav
 import db_manager
 
 SIMILARITY_THRESHOLD = 0.75
 SAMPLE_RATE = 16000
 
-_encoder: VoiceEncoder | None = None
+_encoder = None
 
 
-def get_encoder() -> VoiceEncoder:
+def get_encoder():
+    from resemblyzer import VoiceEncoder  # 初回話者識別時のみロード（遅延import）
     global _encoder
     if _encoder is None:
         _encoder = VoiceEncoder()
@@ -17,6 +17,7 @@ def get_encoder() -> VoiceEncoder:
 
 def get_embedding(audio: np.ndarray) -> np.ndarray:
     """float32 numpy配列（16kHz）からd-vectorを生成する"""
+    from resemblyzer import preprocess_wav
     enc = get_encoder()
     wav = preprocess_wav(audio, source_sr=SAMPLE_RATE)
     return enc.embed_utterance(wav)

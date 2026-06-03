@@ -2,7 +2,7 @@
 
 export const dynamic = "force-dynamic";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { createClient } from "@supabase/supabase-js";
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
@@ -21,9 +21,9 @@ type Utterance = {
   text: string;
   tag: string;
   summary: string;
+  status: string; // "pending" | "processing" | "done" | "error"
 };
 
-// 話者ごとの色（最大10名）
 const SPEAKER_COLORS = [
   "bg-blue-100 text-blue-800",
   "bg-green-100 text-green-800",
@@ -50,14 +50,77 @@ function useSpeakerColor() {
   };
 }
 
+// TSV形式でExcelに貼り付けられる文字列を生成
+function toTsv(utterances: Utterance[]): string {
+  const headers = ["時刻", "話者", "発言内容", "タグ", "要約"];
+  const escape = (v: string) => {
+    if (/[\t\n"]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
+    return v;
+  };
+  const rows = utterances
+    .filter((u) => u.status === "done")
+    .map((u) =>
+      [u.ts, u.speaker, u.text, u.tag, u.summary].map(escape).join("\t")
+    );
+  return [headers.join("\t"), ...rows].join("\n");
+}
+
 export default function Home() {
   const [utterances, setUtterances] = useState<Utterance[]>([]);
   const [sessions, setSessions] = useState<string[]>([]);
   const [selectedSession, setSelectedSession] = useState<string>("latest");
   const [autoScroll, setAutoScroll] = useState(true);
   const [connected, setConnected] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [showSessionModal, setShowSessionModal] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const getSpeakerColor = useSpeakerColor();
+  const processingRef = useRef<Set<number>>(new Set());
+  const utterancesRef = useRef<Utterance[]>([]);
+
+  // 短いセッションID生成（6文字・紛らわしい文字を除外）
+  const generateSessionId = () => {
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    return Array.from({ length: 6 }, () =>
+      chars[Math.floor(Math.random() * chars.length)]
+    ).join("");
+  };
+
+  const handleNewSession = () => {
+    const newId = generateSessionId();
+    setActiveSessionId(newId);
+    setSelectedSession(newId);
+    setShowSessionModal(true);
+  };
+
+  // utterancesRefを常に最新に保つ
+  useEffect(() => {
+    utterancesRef.current = utterances;
+  }, [utterances]);
+
+  // pending utteranceをAPIルートに送って処理
+  const processUtterance = useCallback(async (u: Utterance) => {
+    if (processingRef.current.has(u.id)) return;
+    processingRef.current.add(u.id);
+
+    const context = utterancesRef.current
+      .filter((x) => x.status === "done")
+      .slice(-10)
+      .map(({ tag, speaker, text }) => ({ tag, speaker, text }));
+
+    try {
+      await fetch("/api/process", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: u.id, context }),
+      });
+    } catch (e) {
+      console.error("[process]", e);
+    } finally {
+      processingRef.current.delete(u.id);
+    }
+  }, []);
 
   // セッション一覧を取得
   useEffect(() => {
@@ -91,20 +154,25 @@ export default function Home() {
     if (selectedSession !== "latest") {
       query = query.eq("session_id", selectedSession);
     } else {
-      // 最新セッション：当日分すべて
       const today = new Date();
       today.setHours(0, 0, 0, 0);
       query = query.gte("created_at", today.toISOString());
     }
 
     query.then(({ data }) => {
-      setUtterances(data ?? []);
+      const rows = data ?? [];
+      setUtterances(rows);
+      // 未処理のpendingを再トリガー
+      rows
+        .filter((u) => u.status === "pending")
+        .forEach(processUtterance);
     });
-  }, [selectedSession]);
+  }, [selectedSession, processUtterance]);
 
-  // リアルタイム購読
+  // リアルタイム購読（INSERT / UPDATE）
   useEffect(() => {
     if (!supabase) return;
+
     const channel = supabase
       .channel("utterances-realtime")
       .on(
@@ -122,7 +190,18 @@ export default function Home() {
                 ? prev
                 : [row.session_id, ...prev]
             );
+            if (row.status === "pending") processUtterance(row);
           }
+        }
+      )
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "utterances" },
+        (payload) => {
+          const row = payload.new as Utterance;
+          setUtterances((prev) =>
+            prev.map((u) => (u.id === row.id ? row : u))
+          );
         }
       )
       .subscribe((status) => {
@@ -132,7 +211,7 @@ export default function Home() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [selectedSession]);
+  }, [selectedSession, processUtterance]);
 
   // 自動スクロール
   useEffect(() => {
@@ -141,17 +220,24 @@ export default function Home() {
     }
   }, [utterances, autoScroll]);
 
+  // Excelコピー
+  const handleCopy = () => {
+    navigator.clipboard.writeText(toTsv(utterances)).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
   return (
-    <div className="flex flex-col h-screen">
+    <div className="flex flex-col h-screen bg-gray-50">
       {/* ヘッダー */}
-      <header className="bg-white border-b px-4 py-3 flex items-center gap-4 flex-wrap shadow-sm">
-        <h1 className="text-lg font-bold text-gray-800 whitespace-nowrap">
+      <header className="bg-white border-b px-4 py-2 flex items-center gap-3 flex-wrap shadow-sm">
+        <h1 className="text-base font-bold text-gray-800 whitespace-nowrap">
           📻 トランシーバ記録ビューア
         </h1>
 
-        {/* 接続状態 */}
         <span
-          className={`text-xs px-2 py-1 rounded-full font-medium ${
+          className={`text-xs px-2 py-0.5 rounded-full font-medium ${
             connected
               ? "bg-green-100 text-green-700"
               : "bg-gray-100 text-gray-500"
@@ -160,11 +246,11 @@ export default function Home() {
           {connected ? "● リアルタイム接続中" : "○ 接続中..."}
         </span>
 
-        {/* セッション選択 */}
         <div className="flex items-center gap-2 ml-auto flex-wrap">
-          <label className="text-sm text-gray-600">セッション：</label>
+          {/* セッション選択 */}
+          <label className="text-xs text-gray-600">セッション：</label>
           <select
-            className="text-sm border rounded px-2 py-1 bg-white"
+            className="text-xs border rounded px-2 py-1 bg-white"
             value={selectedSession}
             onChange={(e) => setSelectedSession(e.target.value)}
           >
@@ -177,7 +263,7 @@ export default function Home() {
           </select>
 
           {/* 自動スクロール */}
-          <label className="flex items-center gap-1 text-sm text-gray-600 cursor-pointer select-none">
+          <label className="flex items-center gap-1 text-xs text-gray-600 cursor-pointer select-none">
             <input
               type="checkbox"
               checked={autoScroll}
@@ -187,7 +273,29 @@ export default function Home() {
             最新へ自動スクロール
           </label>
 
-          <span className="text-xs text-gray-400">{utterances.length}件</span>
+          {/* 新しい会話ボタン */}
+          <button
+            onClick={handleNewSession}
+            className="text-xs px-3 py-1 rounded border font-medium bg-white border-gray-300 text-gray-700 hover:bg-gray-100"
+          >
+            ＋ 新しい会話
+          </button>
+
+          {/* Excelコピーボタン */}
+          <button
+            onClick={handleCopy}
+            className={`text-xs px-3 py-1 rounded border font-medium transition-colors ${
+              copied
+                ? "bg-green-100 border-green-400 text-green-700"
+                : "bg-white border-gray-300 text-gray-700 hover:bg-gray-100"
+            }`}
+          >
+            {copied ? "✓ コピー済" : "📋 Excelにコピー"}
+          </button>
+
+          <span className="text-xs text-gray-400">
+            {utterances.filter((u) => u.status === "done").length}件
+          </span>
         </div>
       </header>
 
@@ -196,11 +304,21 @@ export default function Home() {
         <table className="w-full text-sm border-collapse">
           <thead className="bg-gray-100 sticky top-0 z-10">
             <tr>
-              <th className="px-3 py-2 text-left font-semibold text-gray-600 w-20 border-b">時刻</th>
-              <th className="px-3 py-2 text-left font-semibold text-gray-600 w-24 border-b">話者</th>
-              <th className="px-3 py-2 text-left font-semibold text-gray-600 border-b">発言内容</th>
-              <th className="px-3 py-2 text-left font-semibold text-gray-600 w-16 border-b">タグ</th>
-              <th className="px-3 py-2 text-left font-semibold text-gray-600 w-52 border-b">要約</th>
+              <th className="px-3 py-2 text-left font-semibold text-gray-600 w-20 border-b whitespace-nowrap">
+                時刻
+              </th>
+              <th className="px-3 py-2 text-left font-semibold text-gray-600 w-24 border-b whitespace-nowrap">
+                話者
+              </th>
+              <th className="px-3 py-2 text-left font-semibold text-gray-600 border-b">
+                発言内容
+              </th>
+              <th className="px-3 py-2 text-left font-semibold text-gray-600 w-16 border-b whitespace-nowrap">
+                タグ
+              </th>
+              <th className="px-3 py-2 text-left font-semibold text-gray-600 w-56 border-b whitespace-nowrap">
+                要約
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -211,41 +329,113 @@ export default function Home() {
                 </td>
               </tr>
             ) : (
-              utterances.map((u, i) => (
-                <tr
-                  key={u.id}
-                  className={`border-b hover:bg-blue-50 transition-colors ${
-                    i % 2 === 0 ? "bg-white" : "bg-gray-50"
-                  }`}
-                >
-                  <td className="px-3 py-2 text-gray-500 font-mono text-xs whitespace-nowrap">
-                    {u.ts}
-                  </td>
-                  <td className="px-3 py-2">
-                    <span
-                      className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${getSpeakerColor(
-                        u.speaker
-                      )}`}
-                    >
-                      {u.speaker}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2 text-gray-800">{u.text}</td>
-                  <td className="px-3 py-2 text-gray-500 font-mono text-xs">
-                    {u.tag}
-                  </td>
-                  <td className="px-3 py-2 text-gray-600 text-xs">{u.summary}</td>
-                </tr>
-              ))
+              utterances.map((u, i) => {
+                const isPending =
+                  u.status === "pending" || u.status === "processing";
+                const isError = u.status === "error";
+                return (
+                  <tr
+                    key={u.id}
+                    className={`border-b transition-colors ${
+                      isPending
+                        ? "bg-yellow-50"
+                        : isError
+                        ? "bg-red-50"
+                        : i % 2 === 0
+                        ? "bg-white hover:bg-blue-50"
+                        : "bg-gray-50 hover:bg-blue-50"
+                    }`}
+                  >
+                    {/* 時刻 */}
+                    <td className="px-3 py-2 text-gray-500 font-mono text-xs whitespace-nowrap align-top">
+                      {u.ts}
+                    </td>
+                    {/* 話者 */}
+                    <td className="px-3 py-2 align-top">
+                      <span
+                        className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${getSpeakerColor(
+                          u.speaker
+                        )}`}
+                      >
+                        {u.speaker}
+                      </span>
+                    </td>
+                    {/* 発言内容 */}
+                    <td className="px-3 py-2 text-gray-800 align-top max-w-sm">
+                      {isPending ? (
+                        <span className="flex items-center gap-2 text-yellow-600 text-xs">
+                          <svg
+                            className="animate-spin h-3 w-3"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                          >
+                            <circle
+                              className="opacity-25"
+                              cx="12"
+                              cy="12"
+                              r="10"
+                              stroke="currentColor"
+                              strokeWidth="4"
+                            />
+                            <path
+                              className="opacity-75"
+                              fill="currentColor"
+                              d="M4 12a8 8 0 018-8v8H4z"
+                            />
+                          </svg>
+                          ☁ Web処理中...
+                        </span>
+                      ) : (
+                        <span className="whitespace-pre-wrap break-words">
+                          {u.text}
+                        </span>
+                      )}
+                    </td>
+                    {/* タグ */}
+                    <td className="px-3 py-2 text-gray-500 font-mono text-xs align-top whitespace-nowrap">
+                      {u.tag}
+                    </td>
+                    {/* 要約 */}
+                    <td className="px-3 py-2 text-gray-600 text-xs align-top">
+                      <span className="whitespace-pre-wrap break-words">
+                        {u.summary}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })
             )}
           </tbody>
         </table>
         <div ref={bottomRef} />
       </div>
 
+      {/* セッションIDモーダル */}
+      {showSessionModal && activeSessionId && (
+        <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-xl p-8 w-80 text-center">
+            <p className="text-sm text-gray-500 mb-3">新しい会話IDを発行しました</p>
+            <div className="bg-gray-100 rounded-lg py-5 px-4 mb-4">
+              <span className="text-4xl font-bold tracking-[0.3em] text-gray-800 font-mono select-all">
+                {activeSessionId}
+              </span>
+            </div>
+            <p className="text-xs text-gray-500 mb-6">
+              このIDをローカルアプリのセッションID欄に入力してください
+            </p>
+            <button
+              onClick={() => setShowSessionModal(false)}
+              className="w-full py-2 bg-blue-500 text-white rounded-lg font-medium hover:bg-blue-600 transition-colors"
+            >
+              OK
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* フッター */}
-      <footer className="bg-white border-t px-4 py-2 text-xs text-gray-400 text-right">
-        トランシーバ記録システム — 閲覧専用
+      <footer className="bg-white border-t px-4 py-1 text-xs text-gray-400 text-right">
+        トランシーバ記録システム — ブラウザビューア
       </footer>
     </div>
   );

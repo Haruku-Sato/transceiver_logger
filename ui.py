@@ -10,7 +10,6 @@ from datetime import datetime
 
 import audio_capture as ac
 import vad as vad_module
-import transcriber
 import speaker_id
 import db_manager
 import excel_writer
@@ -27,8 +26,9 @@ METER_BARS = 12
 
 
 class App:
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, mode: str = "offline"):
         self.root = root
+        self._mode = mode  # "online" or "offline"
         self.root.title("トランシーバ記録システム")
         self.root.geometry("1280x720")
         self.root.minsize(800, 500)
@@ -70,6 +70,9 @@ class App:
 
         # Supabase
         self._session_id: str = ""
+        # オンラインモードで起動した場合はweb_modeを強制ON
+        default_web = True if mode == "online" else self._ai_cfg.get("web_mode", False)
+        self._web_mode_var = tk.BooleanVar(value=default_web)
 
         # シートビューア
         self._viewer_sheet: TkSheet | None = None
@@ -257,6 +260,27 @@ class App:
             fg="gray", anchor="w", wraplength=440, justify="left"
         ).pack(fill="x", padx=10, pady=(0, 8))
 
+        # Webモード
+        tk.Label(f, text="動作モード", font=("", 10, "bold"), anchor="w").pack(
+            fill="x", padx=10, pady=(4, 2)
+        )
+        mode_frame = tk.Frame(f)
+        mode_frame.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Radiobutton(
+            mode_frame, text="ローカルモード（文字起こし・AI要約をPC上で実行）",
+            variable=self._web_mode_var, value=False
+        ).pack(anchor="w")
+        tk.Radiobutton(
+            mode_frame, text="Webモード（音声をクラウドに送信、ブラウザ側で解析）",
+            variable=self._web_mode_var, value=True
+        ).pack(anchor="w")
+        tk.Label(
+            f, text="※ Webモードはローカルモードより遅延が発生します",
+            fg="gray", font=("", 9)
+        ).pack(anchor="w", padx=10)
+
+        ttk.Separator(f, orient="horizontal").pack(fill="x", padx=6, pady=6)
+
         self._sb_enabled_var = tk.BooleanVar(value=cfg.get("supabase_enabled", False))
         tk.Checkbutton(
             f, text="Supabaseへの送信を有効にする",
@@ -321,6 +345,7 @@ class App:
             "supabase_url": self._sb_url_var.get().strip(),
             "supabase_key": self._sb_key_var.get().strip(),
             "supabase_enabled": self._sb_enabled_var.get(),
+            "web_mode": self._web_mode_var.get(),
         })
         config_manager.save_config(self._ai_cfg)
         self._apply_supabase_config()
@@ -742,6 +767,16 @@ class App:
         self._sheet_cb.bind("<<ComboboxSelected>>", self._on_sheet_change)
         tk.Button(sheet_row, text="更新", command=self._refresh_sheets).pack(side="left")
 
+        # セッションID
+        sid_row = tk.Frame(f)
+        sid_row.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Label(sid_row, text="セッションID：").pack(side="left")
+        self._session_id_var = tk.StringVar()
+        tk.Entry(sid_row, textvariable=self._session_id_var, width=12,
+                 font=("Courier", 12)).pack(side="left", padx=4)
+        tk.Label(sid_row, text="（空白で自動生成）", fg="gray",
+                 font=("", 9)).pack(side="left")
+
         # 検出設定フレーム
         det_frame = ttk.LabelFrame(f, text="検出設定")
         det_frame.pack(fill="x", padx=10, pady=(4, 4))
@@ -960,8 +995,12 @@ class App:
             return
 
         self.is_recording = True
-        import uuid
-        self._session_id = str(uuid.uuid4())
+        manual_id = self._session_id_var.get().strip().upper()
+        if manual_id:
+            self._session_id = manual_id
+        else:
+            import uuid
+            self._session_id = str(uuid.uuid4())[:8].upper()
         self._ai_context.clear()
         self._session_cost_jpy = 0.0
         self._budget_exhausted = False
@@ -1033,7 +1072,29 @@ class App:
             try:
                 self._result_queue.put({"type": "status", "text": "⏳ 解析中..."})
 
-                # speaker IDとWhisperを並列実行
+                # ── Webモード：話者識別＋音声アップロードのみ
+                if self._web_mode_var.get():
+                    spk, sim = speaker_id.identify(audio)
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    if supabase_client.is_enabled():
+                        supabase_client.upload_audio_and_insert_pending(
+                            self._session_id, ts, spk, audio
+                        )
+                        self._result_queue.put({
+                            "type": "web_uploaded",
+                            "speaker": spk,
+                            "similarity": int(sim * 100),
+                            "timestamp": ts,
+                        })
+                    else:
+                        self._result_queue.put({
+                            "type": "status",
+                            "text": "⚠ Supabase未設定 — クラウド設定タブを確認してください",
+                        })
+                    continue
+
+                # ── ローカルモード：speaker IDとWhisperを並列実行
+                import transcriber  # オフラインモード時のみ使用（遅延import）
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
                     f_spk = ex.submit(speaker_id.identify, audio)
                     f_txt = ex.submit(transcriber.transcribe, audio)
@@ -1093,6 +1154,18 @@ class App:
                     self._status_var.set(f"● 待受中　{item['text']}")
                 elif item["type"] == "result":
                     self._auto_output(item)
+                elif item["type"] == "web_uploaded":
+                    spk = item["speaker"]
+                    ts = item["timestamp"]
+                    sim = item["similarity"]
+                    self._status_var.set(
+                        f"● 待受中　{ts}　{spk}（{sim}%）→ ☁ Webに送信済"
+                    )
+                    entry = f"{ts}　{spk}　☁ Web処理中...\n"
+                    self._log_text.config(state="normal")
+                    self._log_text.insert("end", entry)
+                    self._log_text.see("end")
+                    self._log_text.config(state="disabled")
                 elif item["type"] == "error":
                     self._status_var.set(f"エラー: {item['message']}")
         except queue.Empty:

@@ -1,4 +1,3 @@
-import mlx_whisper
 import numpy as np
 from scipy.signal import butter, sosfilt
 from collections import Counter
@@ -70,6 +69,7 @@ def _has_unexpected_script(text: str) -> bool:
 def transcribe(audio: np.ndarray) -> str:
     """float32 numpy配列（16kHz）を受け取り、日本語テキストを返す。
     無音・ハルシネーションと判定した場合は空文字を返す。"""
+    import mlx_whisper  # 初回呼び出し時のみロード（起動高速化のため遅延import）
     audio = _bandpass(audio)
     audio = _normalize(audio)
     result = mlx_whisper.transcribe(
